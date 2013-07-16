@@ -1,0 +1,317 @@
+#!/usr/bin/env nodejs
+/*jshint node: true, laxbreak: true, maxstatements: 100, maxcomplexity: 100 */
+var MongoClient = require('mongodb').MongoClient,
+    async       = require('async'),
+    fs          = require("fs"),
+    Twitter     = require("ntwitter"),
+    log         = require('./common.js').log,
+    pad         = require('./common.js').pad,
+    path        = require('path'),
+    util        = require('util'),
+    optimist    = require("optimist"),
+    ObjectID    = require('mongodb').ObjectID,
+    argv;
+
+argv = optimist
+       .usage('$0 [--query <query>] [--tag <tag>]')
+       .check(function (argv) {
+          "use strict";
+          if (!argv.query && !argv.tag) {
+            throw "You must specify a query or a tag";
+          }
+          if (argv.query && argv.tag) {
+            throw "You must specify a query or a tag";
+          }
+          if (argv.tag && !argv.output) {
+            throw "You must specify an output directory";
+          }
+        })
+       .string('query').describe('query', "fetch tweets matching a query")
+       .string('count').describe("count", "number of tweets to fetch")
+       .string('since').describe("since", "return tweets newer than")
+       .string('max').describe("max", "return tweets older than")
+       .string('tag').describe('tag', "create a timeline for this tag")
+       .string('output').describe('output', "output dir")
+       .boolean('media').describe("media", "display only Tweets with a media")
+       .argv;
+
+//
+// Sample queries
+// - {"entities.hashtags.text": "accessibilité"}
+// - {"entities.media": {$exists: true}
+
+(function () {
+  "use strict";
+
+  var config, query, twitConfig, searchConfig, twit, actions, outputPath, confPath, dataPath;
+  config  = JSON.parse(fs.readFileSync(path.resolve(__dirname, 'nwm.json')));
+
+  /**
+   * Connect to database
+   *
+   * @param {Function} cb
+   */
+  function doConnect(cb) {
+    MongoClient.connect(config.mongo.url, function onConnected(err, db) {
+      if (err) {
+        log.error("Error connecting to searchResultbase : %s", err);
+        process.exit(1);
+      } else {
+        cb(db);
+      }
+    });
+  }
+  /**
+   * Save an array of tweets
+   *
+   * @param {Array}    tweets
+   * @param {Function} cb
+   *
+   */
+  function saveTweets(tweets, cb) {
+    doConnect(function onConnect(db) {
+      var collection = db.collection('tweets'),
+          actions = [];
+      tweets.forEach(function processTweet(tweet) {
+        tweet._id = new ObjectID(pad(tweet.id_str, 24, true));
+        actions.push(function insertTweet(cb) {
+          collection.save(tweet, {}, cb);
+        });
+      });
+      async.parallel(actions, function onSaved(err, res) {
+        console.log("Done saving");
+        console.log(util.inspect(err));
+        res.forEach(function parseResults(result) {
+          if (result[1].updatedExisting === false) {
+            console.log("Inserted with id " + result[1].upserted);
+          } else if (result[1].updatedExisting === true) {
+            console.log('Record already existed');
+          } else {
+            console.log(util.inspect(result));
+          }
+        });
+        collection.count(function doCount(err, count) {
+          console.log("count = " + count);
+          db.close();
+          if (cb) {
+            cb();
+          }
+        });
+        // Locate all the entries using find
+        //collection.find().toArray(function onFound(err, results) {
+        //  console.dir(results);
+        //  db.close();
+        //});
+      });
+
+    });
+
+  }
+  /**
+   * Find tweets in database
+   *
+   * @param {String}   query
+   * @param {Function} cb
+   *
+   */
+  function findTweets(query, cb) {
+    doConnect(function onConnect(db) {
+      var collection = db.collection('tweets');
+      collection.find(query).toArray(function onFound(err, results) {
+        db.close();
+        cb(err, results);
+      });
+    });
+  }
+  /**
+   * Create Timeline
+   */
+  function createTimeline(err, tweets) {
+    if (err) {
+      log.error("Error connecting to searchResultbase : %s", err);
+      process.exit(1);
+    } else {
+      var res = {},
+          doc = "<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\" />\n<body>\n",
+          dates = [],
+          json;
+      tweets.forEach(function processTweet(tweet) {
+        var medias     = tweet.entities.media || [],
+            html       = tweet.text,
+            mentions   = tweet.entities.user_mentions || [],
+            urls       = tweet.entities.urls || [],
+            date       = new Date(tweet.created_at),
+            created_at = date.toLocaleString(),
+            item, hTemp, i;
+        if (typeof tweet.retweeted_status === 'undefined') {
+          medias.forEach(function processMedia(media) {
+            res[media.media_url_https] = true;
+          });
+          hTemp = '<div class="nwm-container">' +
+                  '  <p class="nwm-user">' +
+                  '    <a href="https://twitter.com/%%user_screen_name%%">' +
+                  '      <img alt="%%user_name%%" src="%%user_profile_image_url_https%%" class="nwm-profile"/>' +
+                  '        %%user_name%% — @%%user_screen_name%% </a> </p>' +
+                  '  <p class="nwm-content">%%text%%</p>' +
+                  '  <div class="nwm-metas"> <a href="https://twitter.com/%%user_screen_name%%/status/%%id%%">%%created_at%%</span></a> </div></div>\n';
+          // replace mentions
+          for (i = 0; i < mentions.length; i++) {
+            html = html.replace('@' + mentions[i].screen_name, '<a href="https://twitter.com/' + mentions[i].screen_name + '">@' + mentions[i].screen_name + '</a>', 'g');
+          }
+          // replace urls
+          for (i = 0; i < urls.length; i++) {
+            tweet.text = tweet.text.replace(urls[i].url, urls[i].expanded_url, 'g');
+            html = html.replace(urls[i].url, '<a href="' + urls[i].expanded_url + '">' + urls[i].expanded_url + '</a>', 'g');
+          }
+
+          hTemp = hTemp.replace(/%%user_screen_name%%/g, tweet.user.screen_name);
+          hTemp = hTemp.replace(/%%user_name%%/g, tweet.user.name);
+          hTemp = hTemp.replace(/%%user_profile_image_url_https%%/g, tweet.user.profile_image_url_https);
+          hTemp = hTemp.replace(/%%text%%/g, html);
+          hTemp = hTemp.replace(/%%id%%/g, tweet.id_str);
+          hTemp = hTemp.replace(/%%created_at%%/g, created_at);
+          item = {
+            startDate: date,
+            endDate: date,
+            headline: tweet.text.substr(0, 10) + '…',
+            text: hTemp
+          };
+          if (medias && medias.length > 0) {
+            item.asset = {
+              "media": medias[0].media_url_https
+            };
+          }
+          dates.push(item);
+          /*
+          if (urls.length > 0) {
+            urls.forEach(function (url) {
+              console.log(url.expanded_url);
+            });
+          }
+          */
+        }
+      });
+      json = JSON.parse(fs.readFileSync(confPath));
+      json.timeline.date = dates;
+      Object.keys(res).forEach(function (key) {
+        doc += '<img src="' + key + '" />\n';
+      });
+      doc += "\n</body>\n</html>\n";
+      fs.writeFileSync(dataPath, JSON.stringify(json));
+    }
+  }
+  /**
+   * Create file tree
+   */
+  function createTree(cb) {
+    var actions = [];
+    function copyFile(src, dst, cb) {
+      var srcStream = fs.createReadStream(src),
+          dstStream = fs.createWriteStream(dst);
+      function onError(err) {
+        cb(err);
+      }
+      srcStream.on("error", onError);
+      dstStream.on("error", onError);
+      dstStream.on("close", function () {
+        cb();
+      });
+      srcStream.pipe(dstStream);
+
+    }
+    function createDir(cb) {
+      fs.mkdir(outputPath, 493, cb);
+    }
+    function createFile(dst, src) {
+      return function (cb) {
+        fs.exists(dst, function (exists) {
+          if (exists) {
+            console.log(dst + ' exists');
+            cb();
+          } else {
+            console.log(dst + ' does not exists');
+            copyFile(src, dst, cb);
+          }
+        });
+      };
+    }
+    fs.exists(outputPath, function (exists) {
+      if (!exists) {
+        actions.push(createDir);
+      }
+      actions.push(createFile(confPath, path.resolve(__dirname, 'output/config-sample.json')));
+      actions.push(createFile(outputPath + '/index.html', path.resolve(__dirname, 'output/index.html')));
+      console.log(outputPath);
+      async.series(actions, cb);
+
+    });
+  }
+  if (argv.query) {
+    //{
+    twitConfig = {
+      consumer_key: config.twitter.consumer_key,
+      consumer_secret: config.twitter.consumer_secret,
+      access_token_key: config.twitter.access_token_key,
+      access_token_secret: config.twitter.access_token_secret
+    };
+    searchConfig = {
+      include_entities: true,
+      count:     argv.count,
+      since_id:  argv.since,
+      max_id:    argv.max
+    };
+    twit = new Twitter(twitConfig);
+
+    twit.verifyCredentials(function (err) {
+      if (err) {
+        log.error("Error verifying credentials: %s", err);
+        process.exit(1);
+      }
+    })
+    .search(argv.query, searchConfig, function onSearchResult(err, searchResult) {
+        if (err) {
+          log.error("Error in search : %s", err);
+          process.exit(1);
+        }
+        //console.log(util.inspect(searchResult.statuses, {depth: 1}));
+        saveTweets(searchResult.statuses, function onSaved() {
+          console.log(util.inspect(searchResult.search_metadata));
+          var confName = "nwmconf.json",
+              params = fs.existsSync(confName) ? JSON.parse(fs.readFileSync(confName)) || {} : {};
+          if (typeof params[argv.query] === 'undefined') {
+            params[argv.query] = {};
+          }
+          fs.writeFileSync(confName, JSON.stringify(params));
+        });
+      });
+      //}
+  } else {
+    //{
+    actions = [];
+    query = {};
+    outputPath = path.resolve(__dirname, 'output/' + argv.output);
+    confPath = outputPath + '/config.json';
+    dataPath = outputPath + '/data.json';
+    if (argv.tag) {
+      query["entities.hashtags.text"] = argv.tag.substr(0, 1) === '#' ? argv.tag.substr(1) : argv.tag;
+    }
+    if (argv.media) {
+      query["entities.media"] =  {$exists: true};
+    }
+    actions.push(createTree);
+    actions.push(function (err, cb) {
+      console.log("Creating Timeline");
+      findTweets(query, createTimeline);
+    });
+    async.waterfall(actions, function (err) {
+      if (err) {
+        console.log(err);
+      }
+    });
+    //}
+  }
+
+
+
+})();
+

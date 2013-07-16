@@ -1,0 +1,5 @@
+node_modules/
+nwm.json
+nwmconf.json
+output/*
+source.js
